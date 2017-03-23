@@ -51,7 +51,7 @@ class WriteRegisterMessagesTest(unittest.TestCase):
 
     def testInvalidWriteMultipleRegistersRequest(self):
         request = WriteMultipleRegistersRequest(0, None)
-        self.assertEquals(request.values, [])
+        self.assertEqual(request.values, [])
 
     def testSerializingToString(self):
         for request in iterkeys(self.write):
