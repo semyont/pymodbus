@@ -5,8 +5,6 @@ Pymodbus Exceptions
 Custom exceptions to be used in the Modbus code.
 '''
 
-class IncompleteFrame(Exception):
-    pass
 
 class ModbusException(Exception):
     ''' Base modbus exception '''

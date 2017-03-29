@@ -6,7 +6,7 @@ import struct
 import socket
 from binascii import b2a_hex, a2b_hex
 
-from pymodbus.exceptions import ModbusIOException, IncompleteFrame
+from pymodbus.exceptions import ModbusIOException
 from pymodbus.constants  import Defaults
 from pymodbus.interfaces import IModbusFramer
 from pymodbus.utilities  import checkCRC, computeCRC
@@ -56,36 +56,28 @@ class ModbusTransactionManager(object):
         '''
         retries = self.retries
         request.transaction_id = self.getNextTID()
-        transaction = None
         _logger.debug("Running transaction %d" % request.transaction_id)
 
         while retries > 0:
             try:
                 self.client.connect()
                 self.client._send(self.client.framer.buildPacket(request))
-
+                # I need to fix this to read the header and the result size,
+                # as this may not read the full result set, but right now
+                # it should be fine...
                 result = self.client._recv(1024)
-                while result:
-                    self.client.framer.processIncomingPacket(result, self.addTransaction)
-                    transaction = self.getTransaction(request.transaction_id)
-                    if not transaction:
-                        result = self.client._recv(1024)
-                        continue
-                    break
-
-                if self.retry_on_empty and not transaction:
+                if not result and self.retry_on_empty:
                     retries -= 1
                     continue
-
                 if _logger.isEnabledFor(logging.DEBUG):
                     _logger.debug("recv: " + " ".join([hex(ord(x)) for x in result]))
-                break
-
+                self.client.framer.processIncomingPacket(result, self.addTransaction)
+                break;
             except socket.error, msg:
                 self.client.close()
                 _logger.debug("Transaction failed. (%s) " % msg)
                 retries -= 1
-        return transaction
+        return self.getTransaction(request.transaction_id)
 
     def addTransaction(self, request, tid=None):
         ''' Adds a transaction to the handler
@@ -124,13 +116,6 @@ class ModbusTransactionManager(object):
         '''
         self.tid = (self.tid + 1) & 0xffff
         return self.tid
-
-    def hasTransaction(self, tid):
-        ''' Check if there is a transaction for current tid
-
-        :param tid: The transaction to check
-        '''
-        raise NotImplementedException("hasTransaction")
 
     def reset(self):
         ''' Resets the transaction identifier '''
@@ -189,6 +174,7 @@ class DictTransactionManager(ModbusTransactionManager):
         _logger.debug("deleting transaction %d" % tid)
         self.transactions.pop(tid, None)
 
+
 class FifoTransactionManager(ModbusTransactionManager):
     ''' Impelements a transaction for a manager where the
     results are returned in a FIFO manner.
@@ -240,6 +226,7 @@ class FifoTransactionManager(ModbusTransactionManager):
         _logger.debug("deleting transaction %d" % tid)
         if self.transactions: self.transactions.pop(0)
 
+
 #---------------------------------------------------------------------------#
 # Modbus TCP Message
 #---------------------------------------------------------------------------#
@@ -286,15 +273,12 @@ class ModbusSocketFramer(IModbusFramer):
 
             # someone sent us an error? ignore it
             if self.__header['len'] < 2:
-                return False
+                self.advanceFrame()
             # we have at least a complete message, continue
             elif len(self.__buffer) - self.__hsize + 1 >= self.__header['len']:
                 return True
-            else:
-                raise IncompleteFrame()
-
         # we don't have enough of a message yet, wait
-        raise IncompleteFrame()
+        return False
 
     def advanceFrame(self):
         ''' Skip over the current framed message
@@ -361,18 +345,14 @@ class ModbusSocketFramer(IModbusFramer):
         '''
         self.addToFrame(data)
         while self.isFrameReady():
-            try:
-                if self.checkFrame():
-                    result = self.decoder.decode(self.getFrame())
-                    if result is None:
-                        raise ModbusIOException("Unable to decode request")
-                    self.populateResult(result)
-                    self.advanceFrame()
-                    callback(result)  # defer or push to a thread?
-                else:
-                    self.advanceFrame()
-            except IncompleteFrame:
-                break
+            if self.checkFrame():
+                result = self.decoder.decode(self.getFrame())
+                if result is None:
+                    raise ModbusIOException("Unable to decode request")
+                self.populateResult(result)
+                self.advanceFrame()
+                callback(result)  # defer or push to a thread?
+            else: break
 
     def buildPacket(self, message):
         ''' Creates a ready to send modbus packet
@@ -450,11 +430,11 @@ class ModbusRtuFramer(IModbusFramer):
             self.populateHeader()
             frame_size = self.__header['len']
             data = self.__buffer[:frame_size - 2]
-            crc = self.__header['crc']
+            crc = self.__buffer[frame_size - 2:frame_size]
             crc_val = (ord(crc[0]) << 8) + ord(crc[1])
             return checkCRC(data, crc_val)
         except (IndexError, KeyError):
-            raise IncompleteFrame()
+            return False
 
     def advanceFrame(self):
         ''' Skip over the current framed message
@@ -552,18 +532,14 @@ class ModbusRtuFramer(IModbusFramer):
         '''
         self.addToFrame(data)
         while self.isFrameReady():
-            try:
-                if self.checkFrame():
-                    result = self.decoder.decode(self.getFrame())
-                    if result is None:
-                        raise ModbusIOException("Unable to decode response")
-                    self.populateResult(result)
-                    self.advanceFrame()
-                    callback(result)  # defer or push to a thread?
-                else:
-                    self.resetFrame()
-            except IncompleteFrame:
-                break
+            if self.checkFrame():
+                result = self.decoder.decode(self.getFrame())
+                if result is None:
+                    raise ModbusIOException("Unable to decode response")
+                self.populateResult(result)
+                self.advanceFrame()
+                callback(result)  # defer or push to a thread?
+            else: self.resetFrame() # clear possible errors
 
     def buildPacket(self, message):
         ''' Creates a ready to send modbus packet
@@ -630,8 +606,7 @@ class ModbusAsciiFramer(IModbusFramer):
             self.__header['lrc'] = int(self.__buffer[end - 2:end], 16)
             data = a2b_hex(self.__buffer[start + 1:end - 2])
             return checkLRC(data, self.__header['lrc'])
-
-        raise IncompleteFrame()
+        return False
 
     def advanceFrame(self):
         ''' Skip over the current framed message
@@ -701,18 +676,15 @@ class ModbusAsciiFramer(IModbusFramer):
         '''
         self.addToFrame(data)
         while self.isFrameReady():
-            try:
-                if self.checkFrame():
-                    result = self.decoder.decode(self.getFrame())
-                    if result is None:
-                        raise ModbusIOException("Unable to decode response")
-                    self.populateResult(result)
-                    self.advanceFrame()
-                    callback(result)  # defer this
-                else:
-                    self.advanceFrame()
-            except IncompleteFrame:
-                break
+            if self.checkFrame():
+                result = self.decoder.decode(self.getFrame())
+                if result is None:
+                    raise ModbusIOException("Unable to decode response")
+                self.populateResult(result)
+                self.advanceFrame()
+                callback(result)  # defer this
+            else: break
+
     def buildPacket(self, message):
         ''' Creates a ready to send modbus packet
         Built off of a  modbus request/response
@@ -790,8 +762,7 @@ class ModbusBinaryFramer(IModbusFramer):
             self.__header['crc'] = struct.unpack('>H', self.__buffer[end - 2:end])[0]
             data = self.__buffer[start + 1:end - 2]
             return checkCRC(data, self.__header['crc'])
-
-        raise IncompleteFrame()
+        return False
 
     def advanceFrame(self):
         ''' Skip over the current framed message
@@ -861,18 +832,14 @@ class ModbusBinaryFramer(IModbusFramer):
         '''
         self.addToFrame(data)
         while self.isFrameReady():
-            try:
-                if self.checkFrame():
-                    result = self.decoder.decode(self.getFrame())
-                    if result is None:
-                        raise ModbusIOException("Unable to decode response")
-                    self.populateResult(result)
-                    self.advanceFrame()
-                    callback(result)  # defer or push to a thread?
-                else:
-                    self.advanceFrame()
-            except IncompleteFrame:
-                break
+            if self.checkFrame():
+                result = self.decoder.decode(self.getFrame())
+                if result is None:
+                    raise ModbusIOException("Unable to decode response")
+                self.populateResult(result)
+                self.advanceFrame()
+                callback(result)  # defer or push to a thread?
+            else: break
 
     def buildPacket(self, message):
         ''' Creates a ready to send modbus packet
